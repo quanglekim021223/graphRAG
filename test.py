@@ -355,7 +355,7 @@ def main() -> None:
     try:
         config.validate()
         chatbot = HealthcareGraphRAG(config)
-        question = "Bệnh nhân nào được điều trị bởi bác sĩ kevin wells?"
+        question = "Những bệnh nhân của bệnh viện Cook PLC có nhóm máu nào?"
         result = chatbot.run(question)
         print(f"🔍 Question: {question}")
         print(f"📝 Response: {result['response']}")
