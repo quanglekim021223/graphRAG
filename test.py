@@ -7,12 +7,12 @@ from dotenv import load_dotenv
 from neo4j.time import Date
 from openai import OpenAI, OpenAIError
 from langchain_neo4j import Neo4jGraph
-from langchain_community.vectorstores import Neo4jVector
-from langchain_openai import OpenAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough, RunnableSequence
+from langsmith import Client  # Thêm LangSmith client
 
-# Configure logging globally (can be overridden in production)
+# Configure logging globally
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s"
@@ -22,60 +22,35 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
+# Cấu hình LangSmith
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_API_KEY"] = os.getenv("LANGCHAIN_API_KEY", "")
+os.environ["LANGCHAIN_PROJECT"] = os.getenv(
+    "LANGCHAIN_PROJECT", "HealthcareGraphRAG")
+
 
 @dataclass
 class Config:
-    """Configuration class for Healthcare GraphRAG system.
-
-    Attributes:
-        github_token: GitHub token for OpenAI API authentication.
-        endpoint: OpenAI API endpoint URL.
-        model_name: Model name for text generation.
-        embedding_model: Model name for embedding generation.
-        neo4j_uri: Neo4j database URI.
-        neo4j_username: Neo4j database username.
-        neo4j_password: Neo4j database password.
-    """
+    """Configuration class for Healthcare GraphRAG system."""
     github_token: str = os.getenv("GITHUB_TOKEN", "")
     endpoint: str = "https://models.inference.ai.azure.com"
     model_name: str = "gpt-4o-mini"
-    embedding_model: str = "text-embedding-3-small"
     neo4j_uri: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
     neo4j_username: str = os.getenv("NEO4J_USERNAME", "neo4j")
     neo4j_password: str = os.getenv("NEO4J_PASSWORD", "12345678")
 
     def validate(self) -> None:
-        """Validate the configuration.
-
-        Raises:
-            ValueError: If any required configuration is missing or invalid.
-        """
+        """Validate the configuration."""
         if not self.github_token:
             raise ValueError(
                 "GITHUB_TOKEN must be provided in environment variables.")
+        if not os.getenv("LANGCHAIN_API_KEY"):
+            raise ValueError(
+                "LANGCHAIN_API_KEY must be provided in environment variables.")
 
 
 class HealthcareGraphRAG:
-    """A GraphRAG system for healthcare queries using Neo4j and OpenAI.
-
-    Attributes:
-        config: Configuration object for the system.
-        llm: OpenAI client for text generation.
-        graph: Neo4j database connection.
-        schema: Neo4j schema dictionary.
-        embeddings: Embedding generator for vector retrieval.
-        vector_store: Vector store for Neo4j nodes.
-    """
-
     def __init__(self, config: Config) -> None:
-        """Initialize the HealthcareGraphRAG system.
-
-        Args:
-            config: Configuration object with system settings.
-
-        Raises:
-            ValueError: If initialization fails due to connectivity or configuration issues.
-        """
         self.config = config
         self.config.validate()
 
@@ -90,25 +65,14 @@ class HealthcareGraphRAG:
             self.schema = self.graph.get_structured_schema
             logger.info("Neo4j schema loaded successfully.")
 
-            self.embeddings = OpenAIEmbeddings(
-                openai_api_base=config.endpoint,
-                openai_api_key=config.github_token,
-                model=config.embedding_model
-            )
+            # Sử dụng HuggingFaceEmbeddings
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name="sentence-transformers/all-MiniLM-L6-v2")
+            logger.info("Embeddings initialized successfully.")
 
-            self.vector_store = Neo4jVector.from_existing_graph(
-                embedding=self.embeddings,
-                url=config.neo4j_uri,
-                username=config.neo4j_username,
-                password=config.neo4j_password,
-                index_name="healthcare_vector_index",
-                node_label=["Patient", "Disease", "Doctor", "Hospital",
-                            "InsuranceProvider", "Room", "Medication", "TestResults", "Billing"],
-                text_node_properties=["name", "age", "gender", "blood_type", "admission_type",
-                                      "date_of_admission", "discharge_date", "test_outcome", "amount"],
-                embedding_node_property="embedding"
-            )
-            logger.info("Vector store initialized successfully.")
+            # Khởi tạo LangSmith client
+            self.langsmith_client = Client()
+            logger.info("LangSmith client initialized successfully.")
         except OpenAIError as e:
             logger.error(f"OpenAI initialization failed: {str(e)}")
             raise ValueError(f"Failed to initialize OpenAI client: {str(e)}")
@@ -116,19 +80,37 @@ class HealthcareGraphRAG:
             logger.error(f"System initialization failed: {str(e)}")
             raise ValueError(f"Failed to initialize GraphRAG system: {str(e)}")
 
+    def search_context(self, query_text: str, top_k: int = 10) -> List[Any]:
+        query_embedding = self.embeddings.embed_documents([query_text])[0]
+        indexes = [
+            "healthcare_vector_index_patient",
+            "healthcare_vector_index_disease",
+            "healthcare_vector_index_doctor",
+            "healthcare_vector_index_hospital",
+            "healthcare_vector_index_insuranceprovider",
+            "healthcare_vector_index_room",
+            "healthcare_vector_index_medication",
+            "healthcare_vector_index_testresults",
+            "healthcare_vector_index_billing"
+        ]
+        all_results = []
+        with self.graph._driver.session() as session:
+            for index_name in indexes:
+                query = """
+                CALL db.index.vector.queryNodes($index_name, $top_k, $query_embedding)
+                YIELD node, score
+                RETURN node.text AS context, score
+                ORDER BY score DESC
+                LIMIT $top_k
+                """
+                result = session.run(
+                    query, index_name=index_name, top_k=top_k, query_embedding=query_embedding)
+                all_results.extend(
+                    [(record["context"], record["score"]) for record in result])
+        all_results.sort(key=lambda x: x[1], reverse=True)
+        return all_results[:top_k]
+
     def _generate_cypher_query(self, question: str, schema: Dict[str, Any]) -> str:
-        """Generate a Cypher query from a user question.
-
-        Args:
-            question: The user's natural language question.
-            schema: Neo4j schema dictionary.
-
-        Returns:
-            str: A valid Cypher query string.
-
-        Raises:
-            ValueError: If query generation fails.
-        """
         prompt = PromptTemplate(
             input_variables=["schema", "question"],
             template="""
@@ -137,11 +119,11 @@ class HealthcareGraphRAG:
 
             Generate an accurate Cypher query to answer: "{question}".
             - Use labels: Patient(name, age, gender, blood_type, admission_type, date_of_admission, discharge_date),
-              Disease(name), Doctor(name), Hospital(name), InsuranceProvider(name), Room(room_number),
-              Medication(name), TestResults(test_outcome), Billing(amount).
+            Disease(name), Doctor(name), Hospital(name), InsuranceProvider(name), Room(room_number),
+            Medication(name), TestResults(test_outcome), Billing(amount).
             - Relationships: HAS_DISEASE, TREATED_BY, ADMITTED_TO, COVERED_BY, STAY_IN, TAKE_MEDICATION,
-              UNDERGOES, HAS_BILLING, WORKS_AT, PRESCRIBES, RELATED_TO_TEST, PARTNERS_WITH.
-            - Use toLower() for name attributes to ensure case-insensitive matching.
+            UNDERGOES, HAS_BILLING, WORKS_AT, PRESCRIBES, RELATED_TO_TEST, PARTNERS_WITH.
+            - For name attributes, use case-insensitive matching by applying toLower() on both the node's property and the input value, e.g., WHERE toLower(n.name) = toLower('value').
             - Return only the Cypher query, no markdown or extra text.
             - Ensure valid syntax with MATCH, RETURN, LIMIT 5, matching the schema.
             """
@@ -166,18 +148,6 @@ class HealthcareGraphRAG:
             raise ValueError(f"Cypher query generation failed: {str(e)}")
 
     def _validate_cypher_query(self, query: str, schema: Dict[str, Any]) -> str:
-        """Validate a Cypher query against the schema.
-
-        Args:
-            query: Cypher query string to validate.
-            schema: Neo4j schema dictionary.
-
-        Returns:
-            str: Validated Cypher query string.
-
-        Raises:
-            ValueError: If the query is invalid.
-        """
         prompt = PromptTemplate(
             input_variables=["schema", "query"],
             template="""
@@ -214,17 +184,6 @@ class HealthcareGraphRAG:
             raise ValueError(f"Cypher query validation failed: {str(e)}")
 
     def _execute_query(self, query: str) -> List[Dict[str, Any]]:
-        """Execute a Cypher query on Neo4j.
-
-        Args:
-            query: Cypher query string.
-
-        Returns:
-            List[Dict[str, Any]]: Query results as a list of dictionaries.
-
-        Raises:
-            ValueError: If query execution fails.
-        """
         try:
             result = self.graph.query(query)
             return [
@@ -237,19 +196,6 @@ class HealthcareGraphRAG:
             raise ValueError(f"Query execution failed: {str(e)}")
 
     def _generate_response(self, question: str, query_result: List[Dict[str, Any]], context: List[Any]) -> Dict[str, Any]:
-        """Generate a natural language response from query results and context.
-
-        Args:
-            question: User's natural language question.
-            query_result: Results from Neo4j query.
-            context: Context from vector retrieval.
-
-        Returns:
-            Dict[str, Any]: Dictionary with query results and response text.
-
-        Raises:
-            ValueError: If response generation fails.
-        """
         prompt = PromptTemplate(
             input_variables=["question", "result", "context"],
             template="""
@@ -261,16 +207,13 @@ class HealthcareGraphRAG:
             """
         )
         try:
-            context_text = [doc.page_content if hasattr(
-                doc, 'page_content') else str(doc) for doc in context]
+            context_text = [doc[0] if isinstance(doc, tuple) and len(
+                doc) > 0 else str(doc) for doc in context]
             response = self.llm.chat.completions.create(
                 messages=[
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": prompt.format(
-                        question=question,
-                        result=query_result,
-                        context=context_text
-                    )},
+                        question=question, result=query_result, context=context_text)},
                 ],
                 temperature=0.3,
                 max_tokens=1000,
@@ -285,56 +228,52 @@ class HealthcareGraphRAG:
             raise ValueError(f"Unexpected error: {str(e)}")
 
     def get_pipeline(self) -> RunnableSequence:
-        """Construct the GraphRAG pipeline.
-
-        Returns:
-            RunnableSequence: The pipeline for processing queries.
-        """
-        vector_retriever = self.vector_store.as_retriever(
-            search_kwargs={"k": 5})
-
-        return (
+        vector_retriever = RunnableLambda(self.search_context)
+        pipeline = (
             {"question": RunnablePassthrough(), "schema": RunnableLambda(
                 lambda _: self.schema)}
             | RunnableLambda(lambda x: {
                 "question": x["question"],
                 "schema": x["schema"],
                 "context": vector_retriever.invoke(x["question"])
-            })
+            }).with_config(run_name="RetrieveContext")  # Đặt tên cho bước
+            | RunnableLambda(lambda x: {
+                "question": x["question"],
+                "schema": x["schema"],
+                "context": (lambda ctx: (
+                    print("Context details:"),
+                    print(f"Raw context: {ctx}"),
+                    print(f"Number of documents: {len(ctx)}"),
+                    [print(f"Doc {i}: content={doc[0] if isinstance(doc, tuple) else doc}, metadata={None}")
+                     for i, doc in enumerate(ctx)] if ctx else print("No documents found in context"),
+                    ctx
+                )[-1])(x["context"])
+            }).with_config(run_name="DebugContext")  # Đặt tên cho bước
             | RunnableLambda(lambda x: {
                 "question": x["question"],
                 "schema": x["schema"],
                 "context": x["context"],
                 "query": self._generate_cypher_query(x["question"], x["schema"])
-            })
+            }).with_config(run_name="GenerateCypherQuery")  # Đặt tên cho bước
             | RunnableLambda(lambda x: {
                 "question": x["question"],
                 "schema": x["schema"],
                 "context": x["context"],
                 "query": self._validate_cypher_query(x["query"], x["schema"])
-            })
+            }).with_config(run_name="ValidateCypherQuery")  # Đặt tên cho bước
             | RunnableLambda(lambda x: {
                 "question": x["question"],
                 "schema": x["schema"],
                 "context": x["context"],
                 "query": x["query"],
                 "result": self._execute_query(x["query"])
-            })
-            | RunnableLambda(lambda x: self._generate_response(x["question"], x["result"], x["context"]))
+            }).with_config(run_name="ExecuteCypherQuery")  # Đặt tên cho bước
+            | RunnableLambda(lambda x: self._generate_response(x["question"], x["result"], x["context"])
+                             ).with_config(run_name="GenerateResponse")  # Đặt tên cho bước
         )
+        return pipeline
 
     def run(self, question: str) -> Dict[str, Any]:
-        """Run the GraphRAG pipeline for a given question.
-
-        Args:
-            question: User's natural language question.
-
-        Returns:
-            Dict[str, Any]: Dictionary containing query results and response text.
-
-        Raises:
-            ValueError: If pipeline execution fails.
-        """
         try:
             pipeline = self.get_pipeline()
             result = pipeline.invoke(question)
@@ -350,12 +289,11 @@ class HealthcareGraphRAG:
 
 
 def main() -> None:
-    """Main entry point for the Healthcare GraphRAG system."""
     config = Config()
     try:
         config.validate()
         chatbot = HealthcareGraphRAG(config)
-        question = "Những bệnh nhân của bệnh viện Cook PLC có nhóm máu nào?"
+        question = "Which patients are has disease Hypertension?"
         result = chatbot.run(question)
         print(f"🔍 Question: {question}")
         print(f"📝 Response: {result['response']}")
